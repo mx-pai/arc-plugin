@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.cache/
+coverage/
+test-results/
+playwright-report/
+log/
+*.zip
+.DS_Store
+private/
+*.local.json

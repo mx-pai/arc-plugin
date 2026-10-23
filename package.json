@@ -1,0 +1,30 @@
+{
+  "name": "arc-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Arc browsing habits on Chrome's native vertical tabs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/dev.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/core.test.ts",
+    "test:browser": "node tests/browser.mjs",
+    "check": "npm run typecheck && npm test && npm run build",
+    "format": "prettier --write src tests scripts public *.json docs/*.md README.md"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.3.6",
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "esbuild": "0.28.2",
+    "playwright": "1.64.1",
+    "prettier": "3.9.10",
+    "typescript": "7.0.2"
+  }
+}

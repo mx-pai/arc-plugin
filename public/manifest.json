@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Arc Plugin · 浏览工作区",
+  "version": "0.1.0",
+  "description": "增强 Chrome 原生竖向标签栏，保留 Arc 的空间、固定入口与统一搜索习惯",
+  "minimum_chrome_version": "127",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "storage",
+    "bookmarks",
+    "activeTab",
+    "scripting"
+  ],
+  "background": { "service_worker": "worker.js", "type": "module" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "搜索标签、收藏与空间"
+  },
+  "chrome_url_overrides": { "newtab": "newtab.html" },
+  "options_page": "options.html",
+  "omnibox": { "keyword": "arc" },
+  "commands": {
+    "open-palette": {
+      "suggested_key": { "default": "Ctrl+Shift+K", "mac": "Command+Shift+K" },
+      "description": "打开 Arc 命令面板"
+    },
+    "pin-current": {
+      "suggested_key": { "default": "Alt+Shift+P" },
+      "description": "固定当前页面"
+    },
+    "next-space": {
+      "suggested_key": { "default": "Alt+Shift+Right" },
+      "description": "切换到下一个空间"
+    },
+    "previous-space": {
+      "suggested_key": { "default": "Alt+Shift+Left" },
+      "description": "切换到上一个空间"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "icons": { "16": "icon-16.png", "48": "icon-48.png", "128": "icon-128.png" }
+}
