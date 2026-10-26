@@ -52,7 +52,7 @@ Chrome Side Panel API 可创建独立面板，它与原生竖向标签栏属于�
 
 ### 权限与运行生命周期
 
-首版权限为 tabs、tabGroups、storage、bookmarks、activeTab、scripting，标签 URL 与标题用于本机搜索，书签权限用于专属目录，页面注入在用户调用命令后使用临时授权，归档采用独立记录，后续如接入浏览器最近关闭会话再增加 sessions
+当前权限为 tabs、tabGroups、storage、bookmarks、activeTab、scripting、alarms，标签 URL 与标题用于本机搜索，书签权限用于专属目录，页面注入在用户调用命令后使用临时授权，归档采用独立记录，自动归档使用 alarms 周期任务，后续如接入浏览器最近关闭会话再增加 sessions
 
 MV3 后台可能因闲置终止，持久数据保存到 storage.local，会话映射保存到 storage.session，模块中的队列协调当前后台的写入，重启后依据保存状态与当前浏览器重建视图
 
