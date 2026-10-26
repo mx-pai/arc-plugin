@@ -107,9 +107,20 @@ try {
     if (!response.ok) throw new Error(response.error);
     return response.data;
   };
+  const findTabs = (urls) =>
+    worker.evaluate(async (wanted) => {
+      let found = [];
+      for (let i = 0; i < 50; i++) {
+        const tabs = await chrome.tabs.query({});
+        found = tabs.filter((tab) => wanted.includes(tab.url));
+        if (found.length === wanted.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return found;
+    }, urls);
   let snap = await send({ type: "snapshot" });
-  assert.equal(snap.state.spaces.length, 3);
-  pass("worker initializes three persistent spaces");
+  assert.equal(snap.state.spaces.length, 2);
+  pass("worker initializes persistent spaces");
   const browserVersion = context.browser()?.version() ?? "persistent Chromium";
   const one = await worker.evaluate(
     (url) => chrome.tabs.create({ url, active: true }),
@@ -328,6 +339,385 @@ try {
     snap.state.items.map((i) => i.id),
   );
   pass("invalid import reports error without changing saved entries");
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  snap = await send({ type: "snapshot" });
+  const syncItem = snap.state.items.find((i) => i.url === base + "/one");
+  assert.ok(syncItem?.bookmarkId);
+  await worker.evaluate(
+    ({ id, title }) => chrome.bookmarks.update(id, { title }),
+    { id: syncItem.bookmarkId, title: "外部标题" },
+  );
+  await wait(300);
+  snap = await send({ type: "execute", id: "command:check-bookmarks" });
+  assert.equal(
+    snap.state.items.find((i) => i.id === syncItem.id)?.title,
+    "外部标题",
+  );
+  await worker.evaluate(
+    (id) => chrome.bookmarks.remove(id),
+    syncItem.bookmarkId,
+  );
+  await wait(300);
+  snap = await send({ type: "execute", id: "command:check-bookmarks" });
+  const lost = snap.state.items.find((i) => i.id === syncItem.id);
+  assert.equal(lost?.missing?.reason, "deleted");
+  assert.ok(lost.url);
+  await send({ type: "repair-item", id: syncItem.id });
+  snap = await send({ type: "snapshot" });
+  const repaired = snap.state.items.find((i) => i.id === syncItem.id);
+  assert.ok(repaired.bookmarkId);
+  assert.equal(repaired.bookmarkId === syncItem.bookmarkId, false);
+  assert.equal(repaired.missing, undefined);
+  pass("external bookmark edits, deletion and repair stay in sync");
+  const workBookmark = snap.state.spaces.find((s) => s.id === "work")
+    .bookmarkId;
+  const external = await worker.evaluate(
+    ({ parentId, url }) =>
+      chrome.bookmarks.create({ parentId, title: "外部新增", url }),
+    { parentId: workBookmark, url: base + "/external" },
+  );
+  await wait(300);
+  snap = await send({ type: "execute", id: "command:check-bookmarks" });
+  const adopted = snap.state.items.find((i) => i.bookmarkId === external.id);
+  assert.ok(adopted);
+  assert.equal(adopted.spaceId, "work");
+  assert.equal(adopted.scope, "pinned");
+  await worker.evaluate((id) => chrome.bookmarks.remove(id), external.id);
+  await wait(800);
+  pass("externally created bookmarks are adopted into the matching space");
+  const splitFixture = JSON.stringify({
+    sidebar: {
+      containers: [
+        {
+          spaces: [
+            "split-space",
+            { title: "分屏空间", newContainerIDs: [{ pinned: {} }, "sr"] },
+          ],
+          items: [
+            "sr",
+            {
+              id: "sr",
+              data: { itemContainer: {} },
+              childrenIds: ["sp2", "sp3", "sp1"],
+            },
+            "sp2",
+            {
+              id: "sp2",
+              data: { splitView: { itemWidthFactors: [0.5, 0.5] } },
+              childrenIds: ["sx", "sy"],
+            },
+            "sx",
+            { id: "sx", data: { tab: { savedURL: base + "/split-a" } } },
+            "sy",
+            { id: "sy", data: { tab: { savedURL: base + "/split-b" } } },
+            "sp3",
+            {
+              id: "sp3",
+              data: { splitView: {} },
+              childrenIds: ["sx2", "sy2", "sz2"],
+            },
+            "sx2",
+            { id: "sx2", data: { tab: { savedURL: base + "/split-c" } } },
+            "sy2",
+            { id: "sy2", data: { tab: { savedURL: base + "/split-d" } } },
+            "sz2",
+            { id: "sz2", data: { tab: { savedURL: base + "/split-e" } } },
+            "sp1",
+            { id: "sp1", data: { splitView: {} }, childrenIds: ["s1"] },
+            "s1",
+            { id: "s1", data: { tab: { savedURL: base + "/split-one" } } },
+          ],
+        },
+      ],
+    },
+  });
+  const splitPreview = await send({
+    type: "preview-import",
+    text: splitFixture,
+  });
+  assert.equal(splitPreview.counts.splits, 3);
+  await send({ type: "import", text: splitFixture });
+  const importedCount = (await send({ type: "snapshot" })).state.items.length;
+  await wait(900);
+  assert.equal(
+    (await send({ type: "snapshot" })).state.items.length,
+    importedCount,
+    "import must not be re-adopted by bookmark reconciliation",
+  );
+  const canSplit = await worker.evaluate(
+    () => typeof chrome.tabs.createSplit === "function",
+  );
+  let splitError = "";
+  if (canSplit) {
+    try {
+      await send({ type: "execute", id: "item:arc:sp2" });
+    } catch (error) {
+      splitError = error.message;
+    }
+  } else {
+    try {
+      await send({ type: "execute", id: "item:arc:sp2" });
+    } catch (error) {
+      splitError = error.message;
+    }
+  }
+  if (canSplit && !splitError) {
+    const pair = await findTabs([base + "/split-a", base + "/split-b"]);
+    assert.equal(pair.length, 2);
+    assert.ok(pair[0].splitViewId);
+    assert.equal(pair[0].splitViewId, pair[1].splitViewId);
+    const origin = pair.find((t) => t.active)?.id ?? pair[0].id;
+    await send({ type: "execute", id: "command:unsplit", originTabId: origin });
+    const afterUnsplit = await worker.evaluate(
+      (id) => chrome.tabs.get(id).then((t) => t.splitViewId ?? null),
+      pair[0].id,
+    );
+    assert.ok(afterUnsplit === null || afterUnsplit < 0);
+    await worker.evaluate(
+      (ids) => chrome.tabs.remove(ids),
+      pair.map((t) => t.id),
+    );
+    pass("two-page split opens natively and can be unsplit");
+  } else {
+    assert.match(splitError, /155|分屏|至少/);
+    pass("split capability is detected and reported on unsupported builds");
+  }
+  await send({ type: "execute", id: "item:arc:sp3" });
+  const many = await findTabs([
+    base + "/split-c",
+    base + "/split-d",
+    base + "/split-e",
+  ]);
+  assert.equal(many.length, 3);
+  assert.ok(many.every((t) => (t.splitViewId ?? -1) < 0));
+  await worker.evaluate(
+    (ids) => chrome.tabs.remove(ids),
+    many.map((t) => t.id),
+  );
+  pass("three-page split opens each page without native split");
+  let singleError = "";
+  try {
+    await send({ type: "execute", id: "item:arc:sp1" });
+  } catch (error) {
+    singleError = error.message;
+  }
+  assert.match(singleError, /至少需要两个/);
+  assert.equal(
+    await worker.evaluate(
+      (url) =>
+        chrome.tabs.query({}).then((tabs) => tabs.some((t) => t.url === url)),
+      base + "/split-one",
+    ),
+    false,
+  );
+  pass("single-page split reports an error without leaving tabs behind");
+  await send({ type: "execute", id: "space:personal" });
+  snap = await send({ type: "snapshot" });
+  const personalBinding = snap.runtime.bindings.find(
+    (b) => b.spaceId === "personal" && b.windowId === snap.windowId,
+  );
+  assert.ok(personalBinding);
+  const idleTab = await worker.evaluate(
+    async ({ url, groupId }) => {
+      const tab = await chrome.tabs.create({ url, active: false });
+      await chrome.tabs.group({ groupId, tabIds: [tab.id] });
+      return tab;
+    },
+    { url: base + "/auto-idle", groupId: personalBinding.groupId },
+  );
+  const activeTab = await worker.evaluate(
+    async ({ url, groupId }) => {
+      const tab = await chrome.tabs.create({ url, active: true });
+      await chrome.tabs.group({ groupId, tabIds: [tab.id] });
+      return tab;
+    },
+    { url: base + "/auto-active", groupId: personalBinding.groupId },
+  );
+  let runtimeSettings = await send({ type: "get-settings" });
+  assert.equal(runtimeSettings.autoArchive.enabled, false);
+  runtimeSettings = {
+    ...runtimeSettings,
+    autoArchive: {
+      enabled: true,
+      afterDays: 0,
+      scope: "spaces",
+      spaceIds: ["personal"],
+      maxPerRun: 5,
+    },
+  };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  assert.ok(
+    (
+      await worker.evaluate(() => chrome.alarms.getAll())
+    ).some((alarm) => alarm.name === "arc-auto-archive"),
+  );
+  const previewed = await send({ type: "auto-archive-preview" });
+  assert.ok(previewed.some((item) => item.tabId === idleTab.id));
+  assert.equal(
+    previewed.some((item) => item.tabId === activeTab.id),
+    false,
+  );
+  const archived = await send({ type: "run-auto-archive" });
+  assert.equal(archived.archived, 1);
+  assert.equal(
+    await worker.evaluate(
+      (id) =>
+        chrome.tabs
+          .get(id)
+          .then(() => true)
+          .catch(() => false),
+      idleTab.id,
+    ),
+    false,
+  );
+  assert.equal(
+    await worker.evaluate(
+      (id) =>
+        chrome.tabs
+          .get(id)
+          .then(() => true)
+          .catch(() => false),
+      activeTab.id,
+    ),
+    true,
+  );
+  snap = await send({ type: "snapshot" });
+  const autoEntry = snap.state.archives.find(
+    (entry) => entry.url === base + "/auto-idle",
+  );
+  assert.ok(autoEntry);
+  await send({ type: "execute", id: `archive:${autoEntry.id}` });
+  snap = await send({ type: "snapshot" });
+  assert.equal(
+    snap.state.archives.some((entry) => entry.id === autoEntry.id),
+    false,
+  );
+  runtimeSettings = await send({ type: "get-settings" });
+  runtimeSettings = {
+    ...runtimeSettings,
+    autoArchive: { ...runtimeSettings.autoArchive, enabled: false },
+  };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  assert.equal(
+    (
+      await worker.evaluate(() => chrome.alarms.getAll())
+    ).some((alarm) => alarm.name === "arc-auto-archive"),
+    false,
+  );
+  pass("auto archive follows settings, alarm lifecycle and restore");
+  await send({ type: "open-floating", url: base + "/little", mode: "little-arc" });
+  snap = await send({ type: "snapshot" });
+  assert.equal(snap.runtime.floating?.mode, "little-arc");
+  const floatingWindows = await worker.evaluate(() =>
+    chrome.windows.getAll({ populate: true }),
+  );
+  assert.ok(
+    floatingWindows.some(
+      (win) =>
+        win.type === "popup" &&
+        win.tabs?.some((tab) => tab.url === base + "/little"),
+    ),
+  );
+  await worker.evaluate(
+    (id) => chrome.windows.remove(id),
+    snap.runtime.floating.windowId,
+  );
+  await wait(300);
+  assert.equal((await send({ type: "snapshot" })).runtime.floating, undefined);
+  await send({ type: "open-floating", url: base + "/peek", mode: "peek" });
+  snap = await send({ type: "snapshot" });
+  assert.equal(snap.runtime.floating?.mode, "peek");
+  await worker.evaluate(
+    (id) => chrome.windows.remove(id),
+    snap.runtime.floating.windowId,
+  );
+  await wait(300);
+  pass("Little Arc and Peek open tracked popup windows and clean up");
+  runtimeSettings = await send({ type: "get-settings" });
+  runtimeSettings = {
+    ...runtimeSettings,
+    routing: {
+      rules: [
+        {
+          id: "routed",
+          pattern: "127.0.0.1",
+          spaceId: "personal",
+          openIn: "current",
+        },
+      ],
+    },
+  };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  const routedUrl = base + "/routed";
+  await send({ type: "execute", id: "url", query: routedUrl });
+  const routedTab = (
+    await findTabs([routedUrl])
+  )[0];
+  assert.ok(routedTab);
+  assert.equal(routedTab.groupId, personalBinding.groupId);
+  runtimeSettings = await send({ type: "get-settings" });
+  runtimeSettings = {
+    ...runtimeSettings,
+    routing: {
+      rules: [
+        {
+          id: "routed-small",
+          pattern: "127.0.0.1",
+          spaceId: null,
+          openIn: "little-arc",
+        },
+      ],
+    },
+  };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  await send({ type: "execute", id: "url", query: base + "/routed-small" });
+  snap = await send({ type: "snapshot" });
+  assert.equal(snap.runtime.floating?.mode, "little-arc");
+  await worker.evaluate(
+    (id) => chrome.windows.remove(id),
+    snap.runtime.floating.windowId,
+  );
+  await wait(300);
+  runtimeSettings = await send({ type: "get-settings" });
+  runtimeSettings = { ...runtimeSettings, routing: { rules: [] } };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  pass("domain rules route tabs into spaces or Little Arc windows");
+  runtimeSettings = await send({ type: "get-settings" });
+  runtimeSettings = { ...runtimeSettings, newtabFocus: "palette" };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  const focusPage = await context.newPage();
+  await focusPage.goto(`chrome-extension://${id}/newtab.html`);
+  await focusPage.getByRole("combobox").waitFor();
+  await focusPage.waitForFunction(
+    () => document.activeElement?.getAttribute("role") === "combobox",
+  );
+  runtimeSettings = await send({ type: "get-settings" });
+  runtimeSettings = { ...runtimeSettings, newtabFocus: "omnibox" };
+  await send({ type: "set-settings", settings: runtimeSettings });
+  await focusPage.close();
+  pass("new tab focus policy is configurable and defaults to the omnibox");
+  const chordPage = await context.newPage();
+  await chordPage.goto(`chrome-extension://${id}/newtab.html`);
+  await chordPage.getByRole("combobox").fill("研究页面");
+  await chordPage.getByRole("option").first().waitFor();
+  await chordPage.getByRole("combobox").press("Control+Enter");
+  await wait(500);
+  snap = await send({ type: "snapshot" });
+  assert.equal(snap.runtime.floating?.mode, "little-arc");
+  assert.ok(
+    (
+      await worker.evaluate(() =>
+        chrome.windows.getAll({ populate: true }),
+      )
+    ).some((win) => win.type === "popup"),
+  );
+  await worker.evaluate(
+    (id) => chrome.windows.remove(id),
+    snap.runtime.floating.windowId,
+  );
+  await wait(300);
+  await chordPage.close().catch(() => undefined);
+  pass("command palette modifier opens results in a Little Arc window");
   await ui.bringToFront();
   await ui.getByRole("combobox").fill("固定");
   await ui.getByRole("option").first().waitFor();
@@ -458,7 +848,10 @@ try {
     limitations: [
       "原生 Cmd+T 物理按键与地址栏焦点需要在桌面 Chrome 手动验收",
       "命令面板注入使用隔离测试扩展的 localhost 授权，真实 activeTab 授权链需原生快捷键验收",
-      "三页与四页分屏保留组合数据，原生双页 API 按版本检测",
+      "三页与四页分屏保留组合目录并逐项打开，原生双页 API 按版本检测",
+      "Peek 失焦自动关闭与 Little Arc 窗口位置/焦点受窗口管理器影响，需桌面手动验收",
+      "自动归档 alarm 的真实触发周期受 Chrome 后台节流影响，需桌面观察",
+      "原生书签顺序调整（onChildrenReordered）不做同步，只同步增删改移",
     ],
   };
   await writeFile(
