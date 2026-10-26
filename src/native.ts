@@ -2,8 +2,15 @@ import { parseArcSidebar } from "./arc-import.ts";
 import {
   destination,
   documentOf,
+  floatingBounds,
   mergeImport,
+  normalizeSettings,
+  reconcileBookmarks,
+  routeFor,
   safeUrl,
+  selectAutoArchiveCandidates,
+  settingsOf,
+  splitTargets,
   validateBackup,
 } from "./model.ts";
 import {
@@ -18,8 +25,10 @@ import {
 import type {
   AppState,
   Binding,
+  FloatingMode,
   Item,
   RuntimeState,
+  Settings,
   Snapshot,
   Space,
 } from "./types.ts";
@@ -30,6 +39,21 @@ const ownPage = (url?: string) =>
   (url.startsWith(chrome.runtime.getURL("")) ||
     /^chrome:\/\/(newtab|new-tab-page)\//.test(url) ||
     url === "about:blank");
+type ChromeGroupColor = "grey" | "blue" | "red" | "yellow" | "green" | "pink" | "purple" | "cyan" | "orange";
+const CHROME_COLORS: Record<string, ChromeGroupColor> = {
+  purple: "purple", blue: "blue", green: "green", orange: "orange",
+  pink: "pink", cyan: "cyan", red: "red", yellow: "yellow", grey: "grey",
+  peach: "orange", mint: "cyan", lavender: "purple",
+};
+const chromeColor = (c: string): ChromeGroupColor =>
+  CHROME_COLORS[c] ?? "grey";
+let bookmarkQuietUntil = 0;
+export function quietBookmarkSync(ms = 1500): void {
+  bookmarkQuietUntil = Math.max(bookmarkQuietUntil, Date.now() + ms);
+}
+export function bookmarkSyncQuietUntil(): number {
+  return bookmarkQuietUntil;
+}
 const getTab = async (id?: number) => {
   if (id === undefined) return;
   try {
@@ -111,6 +135,8 @@ export async function snapshot(originTabId?: number): Promise<Snapshot> {
       active: t.active,
       audible: t.audible ?? false,
       pinned: t.pinned,
+      lastAccessed: t.lastAccessed,
+      splitViewId: t.splitViewId,
       spaceId: runtime.bindings.find(
         (b) => b.groupId === t.groupId && b.windowId === t.windowId,
       )?.spaceId,
@@ -164,7 +190,7 @@ async function bind(
       });
   await chrome.tabGroups.update(groupId, {
     title: space.name,
-    color: space.color,
+    color: chromeColor(space.color),
     collapsed: false,
   });
   if (!binding) {
@@ -235,7 +261,7 @@ export async function adoptGroup(
   s.runtime.windowSpaces[String(tab.windowId)] = spaceId;
   await chrome.tabGroups.update(tab.groupId, {
     title: space.name,
-    color: space.color,
+    color: chromeColor(space.color),
   });
   await saveRuntime(s.runtime);
   await recordGroups();
@@ -247,6 +273,7 @@ export async function openItem(
   const s = await snapshot(originTabId);
   const item = s.state.items.find((i) => i.id === id);
   if (!item) throw new Error("固定入口不存在");
+  if (item.kind === "split") return openSplit(item, s);
   if (item.kind !== "link") throw new Error("请在设置中展开目录或分屏组合");
   const url = safeUrl(item.url);
   if (!url) throw new Error("这个网址当前无法打开");
@@ -271,6 +298,60 @@ export async function openItem(
   s.runtime.itemTabs[key] = String(tab.id);
   await saveRuntime(s.runtime);
   await recordGroups();
+}
+async function adjacentPair(
+  windowId: number,
+  firstId: number,
+  secondId: number,
+): Promise<[number, number]> {
+  const first = await getTab(firstId);
+  if (!first) throw new Error("页面已经关闭");
+  await chrome.tabs.move(secondId, { index: first.index + 1 });
+  const ordered = (await chrome.tabs.query({ windowId }))
+    .filter((t) => t.id === firstId || t.id === secondId)
+    .sort((a, b) => a.index - b.index);
+  if (ordered.length !== 2) throw new Error("页面已经关闭");
+  return [ordered[0].id!, ordered[1].id!];
+}
+async function openSplit(item: Item, s: Snapshot): Promise<void> {
+  const targets = splitTargets(s.state.items, item.id);
+  if (targets.length < 2) throw new Error("分屏组合至少需要两个有效网页");
+  const api = chrome.tabs as typeof chrome.tabs & {
+    createSplit?: (ids: [number, number]) => Promise<number>;
+  };
+  if (targets.length === 2 && !api.createSplit)
+    throw new Error("原生分屏 API 需要 Chrome 155 或更新版本");
+  const created: number[] = [];
+  try {
+    for (const target of targets) {
+      const tab = await chrome.tabs.create({
+        windowId: s.windowId,
+        url: target.url!,
+        active: false,
+      });
+      created.push(tab.id!);
+    }
+    const space = s.state.spaces.find((p) => p.id === item.spaceId);
+    if (space) {
+      for (const tabId of created)
+        await bind(space, s.windowId, s.runtime, tabId);
+      s.runtime.windowSpaces[String(s.windowId)] = space.id;
+    }
+    if (targets.length === 2 && api.createSplit) {
+      const pair = await adjacentPair(s.windowId, created[0], created[1]);
+      await api.createSplit(pair);
+    }
+    await chrome.tabs.update(created[0], { active: true });
+    targets.forEach((target, index) => {
+      const key = `${s.windowId}:${target.id}`;
+      if (!s.runtime.itemTabs[key]) s.runtime.itemTabs[key] = String(created[index]);
+    });
+    await saveRuntime(s.runtime);
+    await recordGroups();
+  } catch (error) {
+    await Promise.all(created.map((id) => chrome.tabs.remove(id).catch(() => undefined)));
+    throw error;
+  }
 }
 async function bookmarkParent(
   state: AppState,
@@ -323,6 +404,7 @@ export async function pinCurrent(originTabId?: number): Promise<void> {
     return;
   const title = tab.title?.trim() || new URL(url).hostname;
   const parentId = await bookmarkParent(s.state, spaceId);
+  quietBookmarkSync();
   const bookmark = await chrome.bookmarks.create({ parentId, title, url });
   const id = `saved:${crypto.randomUUID()}`;
   s.state.items.push({
@@ -418,18 +500,187 @@ export async function splitCurrent(originTabId?: number): Promise<void> {
       (a, b) => Math.abs(a.index - tab.index) - Math.abs(b.index - tab.index),
     )[0];
   if (!previous) throw new Error("请先在同一分组中打开另一个页面");
-  const index = previous.index < tab.index ? tab.index - 1 : tab.index + 1;
-  await chrome.tabs.move(previous.id!, { index });
-  const ordered = (await chrome.tabs.query({ windowId: tab.windowId }))
-    .filter((t) => t.id === previous.id || t.id === tab.id)
-    .sort((a, b) => a.index - b.index);
-  await api.createSplit([ordered[0].id!, ordered[1].id!]);
+  const pair = await adjacentPair(tab.windowId, previous.id!, tab.id!);
+  await api.createSplit(pair);
+}
+export async function unsplitCurrent(originTabId?: number): Promise<void> {
+  const s = await snapshot(originTabId);
+  const tab = await getTab(s.originTabId);
+  if (!tab?.splitViewId || tab.splitViewId < 0)
+    throw new Error("当前页面不在原生分屏中");
+  const api = chrome.tabs as typeof chrome.tabs & {
+    unsplit?: (splitViewId: number) => Promise<void>;
+  };
+  if (!api.unsplit)
+    throw new Error("原生分屏 API 需要 Chrome 155 或更新版本");
+  await api.unsplit(tab.splitViewId);
+}
+export async function reconcileNow(): Promise<{
+  changed: boolean;
+  adopted: number;
+  markedMissing: number;
+  restored: number;
+}> {
+  const state = await loadState();
+  if (!settingsOf(state).bookmarkSync.enabled || !state.bookmarkRootId)
+    return { changed: false, adopted: 0, markedMissing: 0, restored: 0 };
+  const result = reconcileBookmarks(
+    state,
+    await chrome.bookmarks.getTree(),
+    Date.now(),
+  );
+  if (result.changed) await saveState(result.state);
+  return {
+    changed: result.changed,
+    adopted: result.adopted,
+    markedMissing: result.markedMissing,
+    restored: result.restored,
+  };
+}
+export async function repairItem(id: string): Promise<void> {
+  const s = await snapshot();
+  const item = s.state.items.find((i) => i.id === id);
+  if (!item) throw new Error("条目不存在");
+  if (item.kind !== "link") throw new Error("只有链接可以重新创建书签");
+  const url = safeUrl(item.url);
+  if (!url) throw new Error("这个网址当前无法写入书签");
+  const parentId = await bookmarkParent(s.state, item.spaceId);
+  quietBookmarkSync();
+  const bookmark = await chrome.bookmarks.create({
+    parentId,
+    title: item.title,
+    url,
+  });
+  item.bookmarkId = bookmark.id;
+  delete item.missing;
+  s.state.undo = undefined;
+  await saveState(s.state);
+}
+export async function getSettings(): Promise<Settings> {
+  return settingsOf(await loadState());
+}
+export async function setSettings(value: Settings): Promise<Settings> {
+  const state = await loadState();
+  state.settings = normalizeSettings(value);
+  state.undo = undefined;
+  await saveState(state);
+  return state.settings;
+}
+export async function autoArchivePreview(now = Date.now()) {
+  const s = await snapshot();
+  return selectAutoArchiveCandidates(s.tabs, s.state, s.runtime, now).map(
+    (candidate) => ({
+      tabId: candidate.tabId,
+      title: candidate.title,
+      url: candidate.url,
+      spaceId: candidate.spaceId,
+      idleMs: candidate.idleMs,
+    }),
+  );
+}
+export async function autoArchive(
+  now = Date.now(),
+): Promise<{ archived: number; failed: number }> {
+  const s = await snapshot();
+  const candidates = selectAutoArchiveCandidates(
+    s.tabs,
+    s.state,
+    s.runtime,
+    now,
+  );
+  if (!candidates.length) return { archived: 0, failed: 0 };
+  const entries = candidates.map((candidate) => ({
+    id: crypto.randomUUID(),
+    spaceId: candidate.spaceId,
+    title: candidate.title,
+    url: candidate.url,
+    archivedAt: now,
+  }));
+  s.state.archives.unshift(...entries);
+  s.state.undo = undefined;
+  await saveState(s.state);
+  let failed = 0;
+  for (let index = 0; index < candidates.length; index++) {
+    try {
+      await chrome.tabs.remove(candidates[index].tabId);
+    } catch {
+      failed++;
+      s.state.archives = s.state.archives.filter(
+        (entry) => entry.id !== entries[index].id,
+      );
+    }
+  }
+  if (failed) await saveState(s.state);
+  return { archived: candidates.length - failed, failed };
+}
+export async function closeFloating(): Promise<void> {
+  const runtime = await loadRuntime();
+  const floating = runtime.floating;
+  if (!floating) return;
+  delete runtime.floating;
+  await saveRuntime(runtime);
+  await chrome.windows.remove(floating.windowId).catch(() => undefined);
+}
+export async function openFloating(
+  urlInput: string,
+  mode: FloatingMode,
+  originTabId?: number,
+): Promise<void> {
+  const url = safeUrl(urlInput);
+  if (!url) throw new Error("这个网址当前无法打开");
+  const s = await snapshot(originTabId);
+  await closeFloating();
+  const origin = await getTab(s.originTabId);
+  const parent = origin
+    ? await chrome.windows.get(origin.windowId).catch(() => undefined)
+    : undefined;
+  const bounds = floatingBounds(parent, mode);
+  let win;
+  try {
+    win = await chrome.windows.create({
+      url,
+      type: "popup",
+      focused: true,
+      ...bounds,
+    });
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    if (!/bounds/i.test(text)) throw error;
+    win = await chrome.windows.create({
+      url,
+      type: "popup",
+      focused: true,
+      width: bounds.width,
+      height: bounds.height,
+    });
+  }
+  const tab = win?.tabs?.[0];
+  if (!win?.id || !tab?.id) throw new Error("无法打开小窗");
+  s.runtime.floating = {
+    windowId: win.id,
+    tabId: tab.id,
+    mode,
+    openedAt: Date.now(),
+  };
+  await saveRuntime(s.runtime);
+}
+export async function openFloatingFromCurrent(
+  mode: FloatingMode,
+  originTabId?: number,
+): Promise<void> {
+  const s = await snapshot(originTabId);
+  const tab = await getTab(s.originTabId);
+  const url =
+    safeUrl(tab?.pendingUrl) || safeUrl(tab?.url);
+  if (!url) throw new Error("请先打开一个普通网页");
+  await openFloating(url, mode, originTabId);
 }
 async function mirrorImport(
   state: AppState,
   incomingIds: Set<string>,
   journal: Journal,
 ): Promise<void> {
+  quietBookmarkSync(3000);
   const created = async (
     details: Parameters<typeof chrome.bookmarks.create>[0],
   ) => {
@@ -601,6 +852,7 @@ export async function importArc(
 export async function undoImport(): Promise<void> {
   const state = await loadState();
   if (!state.undo) throw new Error("当前没有可撤销的导入");
+  quietBookmarkSync(3000);
   const failures = await rollbackBookmarks(
     state.undo.createdBookmarkIds,
     state.undo.changedBookmarks,
@@ -613,12 +865,14 @@ export async function undoImport(): Promise<void> {
     windowSpaces: {},
     itemTabs: {},
     previousTabs: {},
+    lastAccessed: {},
   });
 }
 export async function restoreBackup(text: string): Promise<void> {
   const doc = validateBackup(text);
   const before = await loadState();
   const state: AppState = { ...doc };
+  quietBookmarkSync(3000);
   const journal: Journal = {
     before: documentOf(before),
     created: [],
@@ -638,6 +892,7 @@ export async function restoreBackup(text: string): Promise<void> {
       windowSpaces: {},
       itemTabs: {},
       previousTabs: {},
+      lastAccessed: {},
     });
     await chrome.storage.local.remove("pending");
   } catch (error) {
@@ -670,15 +925,26 @@ export async function execute(
   if (id === "url" || id === "search") {
     if (!query.trim() || query.length > 2048)
       throw new Error("请输入网址或搜索词");
+    const target = destination(query).url;
     const s = await snapshot(originTabId);
+    const activeSpaceId =
+      s.runtime.windowSpaces[String(s.windowId)] ?? s.state.spaces[0].id;
+    const route = routeFor(
+      target,
+      settingsOf(s.state),
+      s.state.spaces,
+      activeSpaceId,
+    );
+    if (route.openIn === "little-arc") {
+      await openFloating(target, "little-arc", originTabId);
+      return;
+    }
     const tab = await chrome.tabs.create({
       windowId: s.windowId,
-      url: destination(query).url,
+      url: target,
       active: true,
     });
-    const space = s.state.spaces.find(
-      (p) => p.id === s.runtime.windowSpaces[String(s.windowId)],
-    );
+    const space = s.state.spaces.find((p) => p.id === route.spaceId);
     if (space) await bind(space, s.windowId, s.runtime, tab.id!);
     await saveRuntime(s.runtime);
     return;
@@ -687,6 +953,20 @@ export async function execute(
   if (id === "command:archive") return archiveCurrent(originTabId);
   if (id === "command:restore-last") return restoreArchive();
   if (id === "command:split") return splitCurrent(originTabId);
+  if (id === "command:unsplit") return unsplitCurrent(originTabId);
+  if (id === "command:little-arc")
+    return openFloatingFromCurrent("little-arc", originTabId);
+  if (id === "command:peek")
+    return openFloatingFromCurrent("peek", originTabId);
+  if (id === "command:auto-archive-now") {
+    await autoArchive();
+    return;
+  }
+  if (id === "command:check-bookmarks") {
+    await reconcileNow();
+    return;
+  }
   if (id === "command:settings") return chrome.runtime.openOptionsPage();
+  if (id === "command:new-space") return chrome.runtime.openOptionsPage();
   throw new Error("操作不存在或当前不可用");
 }

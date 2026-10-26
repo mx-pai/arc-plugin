@@ -1,13 +1,20 @@
 export type SpaceColor =
-  | "grey"
+  | "purple"
   | "blue"
+  | "green"
+  | "orange"
+  | "pink"
+  | "cyan"
   | "red"
   | "yellow"
-  | "green"
-  | "pink"
-  | "purple"
-  | "cyan"
-  | "orange";
+  | "grey"
+  | "peach"
+  | "mint"
+  | "lavender";
+export const SPACE_COLORS: readonly SpaceColor[] = [
+  "purple", "blue", "green", "orange", "pink", "cyan",
+  "red", "yellow", "grey", "peach", "mint", "lavender",
+];
 export interface Space {
   id: string;
   name: string;
@@ -26,9 +33,31 @@ export interface Item {
   url?: string;
   children: string[];
   bookmarkId?: string;
+  missing?: { at: number; reason: "deleted" | "moved" | "invalid" };
   orientation?: string;
   weights?: number[];
 }
+export type AutoArchiveScope = "temporary" | "managed" | "spaces";
+export interface AutoArchiveSettings {
+  enabled: boolean;
+  afterDays: number;
+  scope: AutoArchiveScope;
+  spaceIds: string[];
+  maxPerRun: number;
+}
+export interface DomainRule {
+  id: string;
+  pattern: string;
+  spaceId?: string | null;
+  openIn: "current" | "little-arc";
+}
+export interface Settings {
+  bookmarkSync: { enabled: boolean };
+  autoArchive: AutoArchiveSettings;
+  routing: { rules: DomainRule[] };
+  newtabFocus: "omnibox" | "palette";
+}
+export type FloatingMode = "little-arc" | "peek";
 export interface ArchiveEntry {
   id: string;
   spaceId: string;
@@ -57,6 +86,7 @@ export interface DataDocument {
   imports: ImportRecord[];
   groupRecords: GroupRecord[];
   bookmarkRootId?: string;
+  settings?: Settings;
 }
 export interface BookmarkBefore {
   id: string;
@@ -83,6 +113,13 @@ export interface RuntimeState {
   windowSpaces: Record<string, string>;
   itemTabs: Record<string, string>;
   previousTabs: Record<string, number>;
+  lastAccessed: Record<string, number>;
+  floating?: {
+    windowId: number;
+    tabId: number;
+    mode: FloatingMode;
+    openedAt: number;
+  };
 }
 export interface LiveTab {
   id: number;
@@ -93,6 +130,8 @@ export interface LiveTab {
   active: boolean;
   audible: boolean;
   pinned: boolean;
+  lastAccessed?: number;
+  splitViewId?: number;
   spaceId?: string;
   itemId?: string;
 }
@@ -129,8 +168,18 @@ export type Request =
   | { type: "restore"; text: string }
   | { type: "undo-import" }
   | { type: "rename-space"; id: string; name: string }
+  | { type: "create-space"; name: string; color: SpaceColor }
+  | { type: "delete-space"; id: string }
+  | { type: "reorder-spaces"; ids: string[] }
+  | { type: "set-space-color"; id: string; color: SpaceColor }
   | { type: "adopt-group"; spaceId: string; originTabId?: number }
   | { type: "remove-item"; id: string }
+  | { type: "repair-item"; id: string }
+  | { type: "get-settings" }
+  | { type: "set-settings"; settings: Settings }
+  | { type: "auto-archive-preview" }
+  | { type: "run-auto-archive" }
+  | { type: "open-floating"; url: string; mode: FloatingMode; originTabId?: number }
   | { type: "open-palette" };
 export type Response<T = unknown> =
   { ok: true; data: T } | { ok: false; error: string };

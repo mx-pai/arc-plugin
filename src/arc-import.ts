@@ -1,4 +1,5 @@
 import { safeUrl } from "./model.ts";
+import { SPACE_COLORS } from "./types.ts";
 import type { ImportPreview, Item, Space, SpaceColor } from "./types.ts";
 
 type Obj = Record<string, unknown>;
@@ -29,14 +30,7 @@ export function parseArcSidebar(text: string): ImportPreview {
     skipped++;
     if (diagnostics.length < 200) diagnostics.push(message);
   };
-  const colors: SpaceColor[] = [
-    "purple",
-    "blue",
-    "green",
-    "pink",
-    "cyan",
-    "orange",
-  ];
+  const colors = SPACE_COLORS;
   const spaces = new Map<string, Space>();
   const nodes = new Map<string, Obj>();
   for (const c of containers) {

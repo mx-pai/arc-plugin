@@ -5,7 +5,13 @@ export const commands = [
   ["pin", "固定当前页面", "保存到当前空间，关闭页面后保留入口"],
   ["archive", "归档当前页面", "保存网址与空间归属"],
   ["split", "与上一个页面分屏", "使用 Chrome 原生双页分屏"],
+  ["unsplit", "解除当前分屏", "把分屏中的页面恢复为独立标签"],
+  ["little-arc", "以小窗打开当前页面", "Little Arc 浮窗，关闭后回到当前空间"],
+  ["peek", "预览当前页面", "在临时浮窗中查看，失焦自动关闭"],
   ["restore-last", "恢复最近归档", "回到归档前的空间"],
+  ["auto-archive-now", "立即执行自动归档", "按设置归档闲置页面"],
+  ["check-bookmarks", "立即检查书签同步", "对账原生书签与空间目录"],
+  ["new-space", "新建空间", "创建一个新的工作空间"],
   ["settings", "打开设置", "空间、Arc 迁移、备份与快捷键"],
 ] as const;
 const norm = (s: string) => s.normalize("NFKC").toLocaleLowerCase().trim();
@@ -56,18 +62,23 @@ export function search(
         (t.windowId === windowId ? 12 : 0) +
           (t.spaceId === activeSpace ? 8 : 0),
       );
-    for (const i of state.items.filter((i) => i.kind === "link")) {
-      if (tabs.some((t) => t.itemId === i.id)) continue;
+    for (const i of state.items.filter(
+      (i) => i.kind === "link" || i.kind === "split",
+    )) {
+      const split = i.kind === "split";
+      if (!split && tabs.some((t) => t.itemId === i.id)) continue;
       add(
         {
           id: `item:${i.id}`,
           kind: "item",
           title: i.title,
-          subtitle: `${i.scope === "temporary" ? "待打开" : "固定入口"} · ${name(i.spaceId)}`,
+          subtitle: split
+            ? `分屏组合 · ${i.children.length} 页 · ${name(i.spaceId)}`
+            : `${i.scope === "temporary" ? "待打开" : "固定入口"} · ${name(i.spaceId)}`,
           url: i.url,
           spaceId: i.spaceId ?? undefined,
         },
-        i.url ?? "",
+        split ? "分屏 split" : (i.url ?? ""),
         i.spaceId === activeSpace ? 8 : 0,
       );
     }

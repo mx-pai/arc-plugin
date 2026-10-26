@@ -3,10 +3,21 @@ import { safeUrl } from "./model.ts";
 import { search } from "./search.ts";
 import {
   adoptGroup,
+  autoArchive,
+  autoArchivePreview,
+  bookmarkSyncQuietUntil,
+  closeFloating,
   execute,
+  getSettings,
   importArc,
+  openFloating,
+  openFloatingFromCurrent,
+  quietBookmarkSync,
+  reconcileNow,
   recordGroups,
+  repairItem,
   restoreBackup,
+  setSettings,
   snapshot,
   switchSpace,
   undoImport,
@@ -19,6 +30,7 @@ import {
   saveRuntime,
   saveState,
 } from "./state.ts";
+import { SPACE_COLORS } from "./types.ts";
 import type { Request, Response } from "./types.ts";
 
 const message = (error: unknown) =>
@@ -39,6 +51,59 @@ async function openPalette(): Promise<void> {
     } catch {}
   }
   await chrome.action.openPopup();
+}
+const AUTO_ARCHIVE_ALARM = "arc-auto-archive";
+async function syncAutoArchiveAlarm(): Promise<void> {
+  const settings = await getSettings();
+  if (settings.autoArchive.enabled)
+    await chrome.alarms.create(AUTO_ARCHIVE_ALARM, {
+      delayInMinutes: 60,
+      periodInMinutes: 60,
+      persistAcrossSessions: true,
+    });
+  else await chrome.alarms.clear(AUTO_ARCHIVE_ALARM);
+}
+let bookmarkTimer: ReturnType<typeof setTimeout> | undefined;
+let bookmarkFlushAt = 0;
+function queueBookmarkReconcile(): void {
+  const now = Date.now();
+  if (!bookmarkFlushAt) bookmarkFlushAt = now + 3000;
+  if (bookmarkTimer) clearTimeout(bookmarkTimer);
+  const target = Math.min(
+    Math.max(now + 400, bookmarkSyncQuietUntil()),
+    bookmarkFlushAt,
+  );
+  bookmarkTimer = setTimeout(
+    () => {
+      bookmarkTimer = undefined;
+      bookmarkFlushAt = 0;
+      void enqueue(async () => {
+        await recoverJournal();
+        await reconcileNow();
+      }).catch((error) => console.warn("Arc Plugin", message(error)));
+    },
+    Math.max(0, target - now),
+  );
+}
+function schedulePeekCheck(): void {
+  setTimeout(() => {
+    void enqueue(async () => {
+      const runtime = await loadRuntime();
+      const floating = runtime.floating;
+      if (!floating || floating.mode !== "peek") return;
+      if (Date.now() - floating.openedAt < 600) {
+        schedulePeekCheck();
+        return;
+      }
+      const focused = await chrome.windows
+        .getLastFocused({ windowTypes: ["normal", "popup"] })
+        .catch(() => undefined);
+      if (focused?.id === floating.windowId) return;
+      delete runtime.floating;
+      await saveRuntime(runtime);
+      await chrome.windows.remove(floating.windowId).catch(() => undefined);
+    }).catch(() => undefined);
+  }, 650);
 }
 async function handle(
   request: Request,
@@ -83,10 +148,92 @@ async function handle(
       space.name = request.name.trim();
       for (const b of s.runtime.bindings.filter((b) => b.spaceId === space.id))
         await chrome.tabGroups.update(b.groupId, { title: space.name });
-      if (space.bookmarkId)
-        await chrome.bookmarks.update(space.bookmarkId, { title: space.name });
+      if (space.bookmarkId) {
+        quietBookmarkSync();
+        await chrome.bookmarks.update(space.bookmarkId, {
+          title: space.name,
+        });
+      }
       s.state.undo = undefined;
       await saveState(s.state);
+      return;
+    }
+    case "create-space": {
+      if (
+        typeof request.name !== "string" ||
+        !request.name.trim() ||
+        request.name.length > 100
+      )
+        throw new Error("空间名称应为 1–100 个字符");
+      const COLORS = SPACE_COLORS;
+      const color = COLORS.includes(request.color as typeof COLORS[number])
+        ? request.color
+        : COLORS[0];
+      const state = await loadState();
+      if (state.spaces.length >= 20)
+        throw new Error("空间数量已达上限");
+      const id = `space:${Date.now()}`;
+      state.spaces.push({ id, name: request.name.trim(), color });
+      state.undo = undefined;
+      await saveState(state);
+      return;
+    }
+    case "delete-space": {
+      const state = await loadState();
+      const idx = state.spaces.findIndex((s) => s.id === request.id);
+      if (idx < 0) throw new Error("空间不存在");
+      if (state.spaces.length <= 1)
+        throw new Error("至少保留一个空间");
+      const space = state.spaces[idx];
+      if (space.bookmarkId) {
+        try {
+          quietBookmarkSync();
+          await chrome.bookmarks.removeTree(space.bookmarkId);
+        } catch {}
+      }
+      state.items = state.items
+        .filter((i) => i.spaceId !== space.id)
+        .map((i) => ({
+          ...i,
+          children: i.children.filter(
+            (cid) => !state.items.some((c) => c.id === cid && c.spaceId === space.id),
+          ),
+        }));
+      state.archives = state.archives.filter((a) => a.spaceId !== space.id);
+      state.spaces.splice(idx, 1);
+      state.undo = undefined;
+      await saveState(state);
+      const runtime = await loadRuntime();
+      runtime.bindings = runtime.bindings.filter((b) => b.spaceId !== space.id);
+      for (const [wid, sid] of Object.entries(runtime.windowSpaces))
+        if (sid === space.id)
+          runtime.windowSpaces[wid] = state.spaces[0].id;
+      await saveRuntime(runtime);
+      return;
+    }
+    case "reorder-spaces": {
+      if (!Array.isArray(request.ids))
+        throw new Error("排序参数无效");
+      const state = await loadState();
+      const byId = new Map(state.spaces.map((s) => [s.id, s]));
+      const reordered = request.ids
+        .filter((id): id is string => typeof id === "string" && byId.has(id))
+        .map((id) => byId.get(id)!);
+      if (reordered.length !== state.spaces.length)
+        throw new Error("排序列表与空间数量不匹配");
+      state.spaces = reordered;
+      state.undo = undefined;
+      await saveState(state);
+      return;
+    }
+    case "set-space-color": {
+      if (!SPACE_COLORS.includes(request.color)) throw new Error("颜色无效");
+      const state = await loadState();
+      const space = state.spaces.find((s) => s.id === request.id);
+      if (!space) throw new Error("空间不存在");
+      space.color = request.color;
+      state.undo = undefined;
+      await saveState(state);
       return;
     }
     case "remove-item": {
@@ -97,6 +244,7 @@ async function handle(
       if (item.bookmarkId) {
         try {
           await chrome.bookmarks.get(item.bookmarkId);
+          quietBookmarkSync();
           await chrome.bookmarks.remove(item.bookmarkId);
         } catch (error) {
           if (!message(error).includes("Can't find")) throw error;
@@ -119,6 +267,29 @@ async function handle(
     }
     case "open-palette":
       return openPalette();
+    case "repair-item":
+      if (typeof request.id !== "string") throw new Error("条目参数无效");
+      return repairItem(request.id);
+    case "get-settings":
+      return getSettings();
+    case "set-settings": {
+      if (!request.settings || typeof request.settings !== "object")
+        throw new Error("设置参数无效");
+      const settings = await setSettings(request.settings);
+      await syncAutoArchiveAlarm();
+      return settings;
+    }
+    case "auto-archive-preview":
+      return autoArchivePreview();
+    case "run-auto-archive":
+      return autoArchive();
+    case "open-floating":
+      if (typeof request.url !== "string") throw new Error("网址参数无效");
+      return openFloating(
+        request.url,
+        request.mode === "peek" ? "peek" : "little-arc",
+        request.originTabId ?? origin,
+      );
     default:
       throw new Error("不支持的请求");
   }
@@ -142,21 +313,35 @@ chrome.runtime.onInstalled.addListener(() => {
     await chrome.storage.local.setAccessLevel({
       accessLevel: "TRUSTED_CONTEXTS",
     });
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
     await recoverJournal();
-    const state = await loadState();
-    await saveState(state);
+    await setSettings(await getSettings());
+    await reconcileNow();
+    await syncAutoArchiveAlarm();
+    await snapshot();
   });
 });
 chrome.runtime.onStartup.addListener(() => {
   void enqueue(async () => {
     await recoverJournal();
+    await reconcileNow();
+    await syncAutoArchiveAlarm();
     await snapshot();
   });
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== AUTO_ARCHIVE_ALARM) return;
+  void enqueue(async () => {
+    await autoArchive();
+  }).catch((error) => console.warn("Arc Plugin", message(error)));
 });
 chrome.commands.onCommand.addListener((command) => {
   void enqueue(async () => {
     if (command === "open-palette") return openPalette();
     if (command === "pin-current") return execute("command:pin");
+    if (command === "little-arc-current")
+      return openFloatingFromCurrent("little-arc");
+    if (command === "peek-current") return openFloatingFromCurrent("peek");
     if (command === "next-space" || command === "previous-space") {
       const s = await snapshot();
       const current = s.state.spaces.findIndex(
@@ -222,6 +407,7 @@ chrome.tabs.onActivated.addListener((info) => {
     const tab = await chrome.tabs.get(info.tabId).catch(() => undefined);
     if (!tab) return;
     const runtime = await loadRuntime();
+    runtime.lastAccessed[String(info.tabId)] = Date.now();
     if (safeUrl(tab.pendingUrl || tab.url))
       runtime.previousTabs[String(info.windowId)] = info.tabId;
     const b = runtime.bindings.find(
@@ -238,6 +424,8 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
   if (info.isWindowClosing) closingWindows.add(info.windowId);
   void enqueue(async () => {
     const runtime = await loadRuntime();
+    delete runtime.lastAccessed[String(tabId)];
+    if (runtime.floating?.tabId === tabId) delete runtime.floating;
     const itemIds = new Set<string>();
     for (const [key, id] of Object.entries(runtime.itemTabs))
       if (Number(id) === tabId) {
@@ -268,11 +456,12 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
   if (change.url)
     void enqueue(async () => {
+      const runtime = await loadRuntime();
+      runtime.lastAccessed[String(id)] = Date.now();
       if (tab.active && safeUrl(change.url)) {
-        const runtime = await loadRuntime();
         runtime.previousTabs[String(tab.windowId)] = id;
-        await saveRuntime(runtime);
       }
+      await saveRuntime(runtime);
       await recordGroups();
     }).catch(() => undefined);
 });
@@ -312,5 +501,38 @@ chrome.tabGroups.onUpdated.addListener((group) => {
       state.undo = undefined;
       await saveState(state);
     }
+  }).catch(() => undefined);
+});
+const onBookmarkChange = () => queueBookmarkReconcile();
+chrome.bookmarks.onCreated.addListener(onBookmarkChange);
+chrome.bookmarks.onChanged.addListener(onBookmarkChange);
+chrome.bookmarks.onMoved.addListener(onBookmarkChange);
+chrome.bookmarks.onRemoved.addListener(onBookmarkChange);
+chrome.windows.onRemoved.addListener((windowId) => {
+  void enqueue(async () => {
+    const runtime = await loadRuntime();
+    if (runtime.floating?.windowId === windowId) {
+      delete runtime.floating;
+      await saveRuntime(runtime);
+    }
+  }).catch(() => undefined);
+});
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  void enqueue(async () => {
+    const runtime = await loadRuntime();
+    const floating = runtime.floating;
+    if (!floating || floating.mode !== "peek") return;
+    if (windowId === floating.windowId) return;
+    if (Date.now() - floating.openedAt < 600) {
+      schedulePeekCheck();
+      return;
+    }
+    const focused = await chrome.windows
+      .getLastFocused({ windowTypes: ["normal", "popup"] })
+      .catch(() => undefined);
+    if (focused?.id === floating.windowId) return;
+    delete runtime.floating;
+    await saveRuntime(runtime);
+    await chrome.windows.remove(floating.windowId).catch(() => undefined);
   }).catch(() => undefined);
 });
