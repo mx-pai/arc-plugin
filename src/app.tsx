@@ -1,8 +1,14 @@
 import { createRoot } from "react-dom/client";
-import { CommandPalette, Settings } from "./components.tsx";
+import { CommandPalette } from "./palette.tsx";
+import { NewTab } from "./newtab.tsx";
+import { Settings } from "./settings.tsx";
+import { SidePanel } from "./sidepanel.tsx";
 import { isExtension } from "./client.ts";
 
 const mode = document.body.dataset.view ?? "popup";
+if (mode === "popup" || mode === "newtab" || mode === "sidepanel")
+  document.body.classList.add("aurora");
+
 async function close() {
   if (mode === "popup") {
     window.close();
@@ -16,10 +22,11 @@ async function close() {
 createRoot(document.getElementById("root")!).render(
   mode === "options" ? (
     <Settings />
+  ) : mode === "newtab" ? (
+    <NewTab onClose={() => void close()} />
+  ) : mode === "sidepanel" ? (
+    <SidePanel />
   ) : (
-    <CommandPalette
-      mode={mode === "newtab" ? "newtab" : "popup"}
-      onClose={() => void close()}
-    />
+    <CommandPalette mode="popup" onClose={() => void close()} />
   ),
 );

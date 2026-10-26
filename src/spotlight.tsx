@@ -1,5 +1,5 @@
 import { createRoot } from "react-dom/client";
-import { CommandPalette } from "./components.tsx";
+import { CommandPalette } from "./palette.tsx";
 import css from "./styles.css";
 
 const runtime = globalThis as typeof globalThis & {

@@ -2,6 +2,8 @@ import {
   initialRuntime,
   initialState,
   mergeImport,
+  normalizeSettings,
+  settingsOf,
   validateBackup,
 } from "./model.ts";
 import { parseArcSidebar } from "./arc-import.ts";
@@ -24,7 +26,7 @@ const demo = (): Snapshot => {
     },
     {
       id: "demo:arc",
-      spaceId: "personal",
+      spaceId: "work",
       parentId: null,
       kind: "link",
       scope: "pinned",
@@ -77,6 +79,37 @@ export async function request<T = unknown>(message: Request): Promise<T> {
     previewState.state = validateBackup(message.text);
     return undefined as T;
   }
+  if (message.type === "get-settings")
+    return settingsOf(previewState.state) as T;
+  if (message.type === "set-settings") {
+    previewState.state.settings = normalizeSettings(message.settings);
+    return previewState.state.settings as T;
+  }
+  if (message.type === "auto-archive-preview") return [] as T;
+  if (message.type === "run-auto-archive")
+    return { archived: 0, failed: 0 } as T;
+  if (message.type === "create-space") {
+    const id = `space:${Date.now()}`;
+    previewState.state.spaces.push({ id, name: message.name, color: message.color });
+    return structuredClone(previewState) as T;
+  }
+  if (message.type === "delete-space") {
+    previewState.state.spaces = previewState.state.spaces.filter((s) => s.id !== message.id);
+    previewState.state.items = previewState.state.items.filter((i) => i.spaceId !== message.id);
+    return structuredClone(previewState) as T;
+  }
+  if (message.type === "reorder-spaces") {
+    const byId = new Map(previewState.state.spaces.map((s) => [s.id, s]));
+    previewState.state.spaces = message.ids.map((id) => byId.get(id)!).filter(Boolean);
+    return structuredClone(previewState) as T;
+  }
+  if (message.type === "set-space-color") {
+    const space = previewState.state.spaces.find((s) => s.id === message.id);
+    if (space) space.color = message.color;
+    return structuredClone(previewState) as T;
+  }
+  if (message.type === "open-floating" || message.type === "repair-item")
+    throw new Error("这项操作需要在真实扩展中使用");
   if (message.type === "execute") {
     if (message.id.startsWith("space:"))
       previewState.runtime.windowSpaces["1"] = message.id.slice(6);
