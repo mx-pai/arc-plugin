@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Arc Plugin · 浏览工作区",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "增强 Chrome 原生竖向标签栏，保留 Arc 的空间、固定入口与统一搜索习惯",
   "minimum_chrome_version": "127",
   "permissions": [
@@ -10,11 +10,15 @@
     "storage",
     "bookmarks",
     "activeTab",
-    "scripting"
+    "scripting",
+    "alarms",
+    "sidePanel"
   ],
   "background": { "service_worker": "worker.js", "type": "module" },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
   "action": {
-    "default_popup": "popup.html",
     "default_title": "搜索标签、收藏与空间"
   },
   "chrome_url_overrides": { "newtab": "newtab.html" },
@@ -36,6 +40,12 @@
     "previous-space": {
       "suggested_key": { "default": "Alt+Shift+Left" },
       "description": "切换到上一个空间"
+    },
+    "little-arc-current": {
+      "description": "以小窗打开当前页面"
+    },
+    "peek-current": {
+      "description": "预览当前页面"
     }
   },
   "content_security_policy": {
